@@ -1,0 +1,5 @@
+p, alice, /data, read, allow
+p, alice, /data/*/**, read, allow
+p, alice, /data/**, read, deny
+p, bob, /a/*, read, deny
+p, bob, /a/x/y, read, allow
