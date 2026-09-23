@@ -12,4 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .role_manager import RoleManager, DomainManager, ConditionalRoleManager, ConditionalDomainManager
+from .role_manager import (
+    RoleManager,
+    DomainManager,
+    ConditionalRoleManager,
+    ConditionalDomainManager,
+    get_link_tracer,
+    set_link_tracer,
+    reset_link_tracer,
+)

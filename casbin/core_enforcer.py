@@ -17,6 +17,7 @@ import logging
 import re
 
 from casbin.effect import Effector, get_effector, effect_to_bool
+from casbin.explain import EFFECT_NAMES, EnforceRecorder, ExplainOptions
 from casbin.model import Model, FunctionMap
 from casbin.persist import Adapter
 from casbin.persist.adapters import FileAdapter
@@ -395,6 +396,32 @@ class CoreEnforcer:
         input parameters are usually: (sub, obj, act).
         return judge result with reason
         """
+        return self._enforce_ex(rvals)
+
+    def enforce_explain(self, *rvals, options=None):
+        """decides whether a "subject" can access a "object" with the operation "action",
+        and explains how the decision was reached.
+
+        returns (result, explain_rule, report): the first two values follow the
+        enforce_ex contract, the third is an ExplainReport describing this
+        single evaluation (evaluated/skipped policies, matched role paths with
+        their domains, and the effect decision).
+
+        options: an optional ExplainOptions selecting report sections and
+        whether request values / policy text may appear in the report.
+        """
+        recorder = EnforceRecorder(options if options is not None else ExplainOptions())
+        token = default_role_manager.set_link_tracer(recorder)
+        try:
+            result, explain_rule = self._enforce_ex(rvals, recorder=recorder)
+        finally:
+            default_role_manager.reset_link_tracer(token)
+
+        return result, explain_rule, recorder.build_report()
+
+    def _enforce_ex(self, rvals, recorder=None):
+        """internal implementation of enforce_ex, optionally recording an
+        execution explanation into recorder."""
 
         rtype = "r"
         ptype = "p"
@@ -406,12 +433,20 @@ class CoreEnforcer:
 
         functions = self.fm.get_functions()
 
+        g_keys = []
         if "g" in self.model.keys():
             for key, ast in self.model["g"].items():
+                g_keys.append(key)
                 if len(self.rm_map) != 0:
                     functions[key] = generate_g_function(ast.rm)
                 if len(self.cond_rm_map) != 0:
                     functions[key] = generate_conditional_g_function(ast.cond_rm)
+
+        if recorder is not None:
+            # wrap a private copy so the shared function map is never mutated
+            # and later un-explained requests keep no recording state.
+            functions = dict(functions)
+            recorder.wrap_functions(functions, g_keys)
 
         if len(rvals) != 0:
             if isinstance(rvals[0], EnforceContext):
@@ -443,6 +478,9 @@ class CoreEnforcer:
 
         r_parameters = dict(zip(r_tokens, rvals))
 
+        if recorder is not None:
+            recorder.set_request(r_tokens, rvals)
+
         policy_len = len(self.model["p"][ptype].policy)
 
         explain_index = -1
@@ -465,10 +503,14 @@ class CoreEnforcer:
                 if isinstance(result, bool):
                     if not result:
                         policy_effects.add(Effector.INDETERMINATE)
+                        if recorder is not None:
+                            recorder.policy_evaluated(i, pvals, False, EFFECT_NAMES[Effector.INDETERMINATE])
                         continue
                 elif isinstance(result, float):
                     if 0 == result:
                         policy_effects.add(Effector.INDETERMINATE)
+                        if recorder is not None:
+                            recorder.policy_evaluated(i, pvals, False, EFFECT_NAMES[Effector.INDETERMINATE])
                         continue
                 else:
                     raise RuntimeError("matcher result should be bool, int or float")
@@ -478,18 +520,28 @@ class CoreEnforcer:
                     eft = parameters[p_eft_key]
                     if "allow" == eft:
                         policy_effects.add(Effector.ALLOW)
+                        matched_effect = EFFECT_NAMES[Effector.ALLOW]
                     elif "deny" == eft:
                         policy_effects.add(Effector.DENY)
+                        matched_effect = EFFECT_NAMES[Effector.DENY]
                     else:
                         policy_effects.add(Effector.INDETERMINATE)
+                        matched_effect = EFFECT_NAMES[Effector.INDETERMINATE]
                 else:
                     policy_effects.add(Effector.ALLOW)
+                    matched_effect = EFFECT_NAMES[Effector.ALLOW]
+
+                if recorder is not None:
+                    recorder.policy_evaluated(i, pvals, True, matched_effect)
 
                 # Update explain_index for any matching policy before checking early break condition
                 # to ensure explanations are captured for allow rules in deny models
                 explain_index = i
 
-                if self.eft.intermediate_effect(policy_effects) != Effector.INDETERMINATE:
+                intermediate_effect = self.eft.intermediate_effect(policy_effects)
+                if intermediate_effect != Effector.INDETERMINATE:
+                    if recorder is not None:
+                        recorder.loop_terminated(i, intermediate_effect)
                     break
 
         else:
@@ -508,8 +560,14 @@ class CoreEnforcer:
             else:
                 policy_effects.add(Effector.INDETERMINATE)
 
+            if recorder is not None:
+                recorder.set_empty_policy_result(bool(result))
+
         final_effect = self.eft.final_effect(policy_effects)
         result = effect_to_bool(final_effect)
+
+        if recorder is not None:
+            recorder.finalize(policy_effects, final_effect, result, self.model["p"][ptype].policy)
 
         # Log request.
         if (result and self.logger.isEnabledFor(logging.INFO)) or (

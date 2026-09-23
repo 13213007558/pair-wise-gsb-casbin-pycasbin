@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextvars
 import logging
 from collections import namedtuple
 from enum import Enum
@@ -20,6 +21,34 @@ from casbin.rbac import RoleManager as RM
 from casbin.rbac import ConditionalRoleManager as CRM
 
 Link = namedtuple("Link", ["user", "role"])
+
+_link_tracer = contextvars.ContextVar("casbin_link_tracer", default=None)
+
+
+def get_link_tracer():
+    """returns the role-link tracer active for the current enforce call, or None."""
+    return _link_tracer.get()
+
+
+def set_link_tracer(tracer):
+    """activates a role-link tracer, returns a token for reset_link_tracer."""
+    return _link_tracer.set(tracer)
+
+
+def reset_link_tracer(token):
+    """restores the previous tracer state, so later evaluations are not traced."""
+    _link_tracer.reset(token)
+
+
+def _trace_path(parents, target_name):
+    """rebuilds the inheritance chain from the start role to target_name."""
+    path = []
+    current = target_name
+    while current is not None:
+        path.append(current)
+        current = parents.get(current)
+    path.reverse()
+    return path
 
 
 class MatchOrder(Enum):
@@ -187,6 +216,10 @@ class RoleManager(RM):
         return self._has_link(name2, [user], self.max_hierarchy_level)
 
     def _has_link(self, name, roles, level):
+        tracer = get_link_tracer()
+        if tracer is not None:
+            return self._has_link_traced(name, roles, level, tracer)
+
         if level <= 0 or len(roles) == 0:
             return False
 
@@ -197,6 +230,26 @@ class RoleManager(RM):
             next_roles.update(set(role.roles))
 
         return self._has_link(name, list(next_roles), level - 1)
+
+    def _has_link_traced(self, name, roles, level, tracer, parents=None):
+        """mirrors _has_link exactly, additionally reporting the matched role path."""
+        if parents is None:
+            parents = {role.name: None for role in roles}
+
+        if level <= 0 or len(roles) == 0:
+            return False
+
+        next_roles = set()
+        for role in roles:
+            if name == role.name:
+                tracer.role_path(_trace_path(parents, role.name))
+                return True
+            for next_role in role.roles:
+                if next_role.name not in parents:
+                    parents[next_role.name] = role.name
+                next_roles.add(next_role)
+
+        return self._has_link_traced(name, list(next_roles), level - 1, tracer, parents)
 
     def get_roles(self, name, *domain):
         user = self._get_role(name)
@@ -373,6 +426,9 @@ class ConditionalRoleManager(RoleManager, CRM):
     def has_link(self, name1, name2, *domains):
         """determines whether role: name1 inherits role: name2."""
         if name1 == name2 or (self.matching_func is not None and self._matching_fn(name1, name2)):
+            tracer = get_link_tracer()
+            if tracer is not None:
+                tracer.role_path([name1])
             return True
 
         user = self._get_role(name1)
@@ -384,6 +440,10 @@ class ConditionalRoleManager(RoleManager, CRM):
         """use the Breadth First Search algorithm to traverse the Role tree
         Judging whether the user has a role (has link) is to judge whether the role node can be reached from the user node
         """
+        tracer = get_link_tracer()
+        if tracer is not None:
+            return self._has_link_traced(target_name, roles, level, tracer, None, *domains)
+
         if level < 0 or len(roles) == 0:
             return False
 
@@ -400,9 +460,37 @@ class ConditionalRoleManager(RoleManager, CRM):
 
         return self._has_link(target_name, next_roles, level - 1, *domains)
 
+    def _has_link_traced(self, target_name, roles, level, tracer, parents=None, *domains):
+        """mirrors _has_link exactly, additionally reporting the matched role path.
+        Condition functions are still evaluated only by get_next_roles, so no
+        callback runs more often than in an untraced evaluation."""
+        if parents is None:
+            parents = {role.name: None for role in roles}
+
+        if level < 0 or len(roles) == 0:
+            return False
+
+        next_roles = set()
+        for role in roles:
+            if target_name == role.name or (
+                self.matching_func is not None and self._matching_fn(role.name, target_name)
+            ):
+                tracer.role_path(_trace_path(parents, role.name))
+                return True
+
+            for next_role in role.roles:
+                linked_role = self.get_next_roles(role, next_role, domains)
+                for linked in linked_role:
+                    if linked.name not in parents:
+                        parents[linked.name] = role.name
+                next_roles.update(set(linked_role))
+
+        return self._has_link_traced(target_name, next_roles, level - 1, tracer, parents, *domains)
+
     def get_next_roles(self, current_role, next_role, domains):
         pass_link_condition_func = True
         next_roles = list()
+        link_condition_func = None
         if not domains:
             link_condition_func = self.get_link_condition_func(current_role.name, next_role.name)
             if link_condition_func is not None:
@@ -416,6 +504,15 @@ class ConditionalRoleManager(RoleManager, CRM):
 
         if pass_link_condition_func:
             next_roles.append(next_role)
+
+        tracer = get_link_tracer()
+        if tracer is not None and link_condition_func is not None:
+            tracer.condition_edge(
+                current_role.name,
+                next_role.name,
+                pass_link_condition_func,
+                domains[0] if domains else None,
+            )
 
         return next_roles
 
