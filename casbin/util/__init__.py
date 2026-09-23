@@ -14,4 +14,5 @@
 
 from .builtin_operators import *
 from .expression import *
+from .revocation_planner import *
 from .util import *

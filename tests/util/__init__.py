@@ -13,5 +13,6 @@
 # limitations under the License.
 
 from .test_builtin_operators import TestBuiltinOperators
+from .test_revocation_planner import TestRevocationPlanner
 from .test_rwlock import TestRWLock
 from .test_util import TestUtil
