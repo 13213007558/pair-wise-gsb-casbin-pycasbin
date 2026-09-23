@@ -366,6 +366,34 @@ def generate_g_function(rm):
     return f
 
 
+def generate_session_g_function(session, effective_roles):
+    """the factory method of the g(_, _[, _]) function scoped to a RoleSession.
+
+    The returned function only resolves links from the session user to the
+    activated roles (and the roles they inherit), captured in effective_roles.
+    It never touches the shared role manager, so concurrent sessions on one
+    enforcer cannot rewrite each other's role graph.
+    """
+
+    def f(*args):
+        name1 = args[0]
+        name2 = args[1]
+
+        if name1 != session.user:
+            return False
+
+        if session.domain is not None:
+            if len(args) < 3 or str(args[2]) != session.domain:
+                return False
+
+        if name1 == name2:
+            return session.allow_direct_permissions
+
+        return name2 in effective_roles
+
+    return f
+
+
 def generate_conditional_g_function(crm):
     """the factory method of the g(_, _[, _]) function with conditions."""
 

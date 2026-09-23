@@ -21,7 +21,14 @@ from casbin.model import Model, FunctionMap
 from casbin.persist import Adapter
 from casbin.persist.adapters import FileAdapter
 from casbin.rbac import default_role_manager
-from casbin.util import generate_g_function, SimpleEval, util, generate_conditional_g_function
+from casbin.session import RoleSession
+from casbin.util import (
+    generate_g_function,
+    generate_session_g_function,
+    SimpleEval,
+    util,
+    generate_conditional_g_function,
+)
 from casbin.util.log import configure_logging, disabled_logging
 
 
@@ -118,6 +125,8 @@ class CoreEnforcer:
         self.auto_save = True
         self.auto_build_role_links = True
         self.auto_notify_watcher = True
+
+        self.session_exclusive_groups = []
 
         self.init_rm_map()
 
@@ -383,6 +392,87 @@ class CoreEnforcer:
             mtype="m" + suffix,
         )
 
+    def add_exclusive_role_group(self, roles, max_active=1):
+        """adds a mutually exclusive role group for session role activation.
+
+        roles is an iterable of role names that conflict with each other;
+        max_active is the maximum number of roles from this group that a
+        session may effectively hold at once. The check runs against the
+        effective roles of a session, i.e. inherited roles count too.
+        """
+        if max_active < 0:
+            raise ValueError("max_active must not be negative")
+        self.session_exclusive_groups.append((frozenset(roles), max_active))
+
+    def clear_exclusive_role_groups(self):
+        """removes all mutually exclusive role groups."""
+        self.session_exclusive_groups = []
+
+    def new_role_session(self, user, roles, domain=None, allow_direct_permissions=False):
+        """creates a RoleSession that activates a subset of the user's roles.
+
+        Every activated role must be directly assigned to the user (inside the
+        given domain) and the resulting effective roles must satisfy all
+        exclusive role groups, otherwise a ValueError is raised. The session
+        is re-validated on every enforce call, so it stops working as soon as
+        the underlying role grants are revoked.
+
+        allow_direct_permissions decides whether permissions assigned to the
+        user directly (not via a role) are available inside the session. It
+        defaults to False so direct permissions are never silently treated as
+        a default role.
+        """
+        session = RoleSession(user, roles, domain, allow_direct_permissions)
+        self._validate_role_session(session)
+        return session
+
+    def _session_direct_roles(self, session, name):
+        """returns the roles directly assigned to name in the session scope."""
+        rm = self.rm_map.get("g")
+        if rm is None:
+            raise ValueError("model has no role definition, cannot use a role session")
+        if session.domain is None:
+            return rm.get_roles(name)
+        return rm.get_roles(name, session.domain)
+
+    def _session_effective_roles(self, session):
+        """computes the activated roles plus every role they inherit."""
+        rm = self.rm_map.get("g")
+        max_level = getattr(rm, "max_hierarchy_level", 10)
+
+        effective = set()
+        frontier = list(session.roles)
+        while frontier and max_level > 0:
+            next_frontier = []
+            for role in frontier:
+                if role in effective:
+                    continue
+                effective.add(role)
+                next_frontier.extend(self._session_direct_roles(session, role))
+            frontier = next_frontier
+            max_level -= 1
+        return effective
+
+    def _validate_role_session(self, session):
+        """checks a RoleSession against the current role manager.
+
+        Raises ValueError if an activated role is not directly assigned to the
+        user or if the effective roles violate an exclusive role group.
+        """
+        owned = set(self._session_direct_roles(session, session.user))
+        for role in session.roles:
+            if role not in owned:
+                raise ValueError(f'role "{role}" is not assigned to user "{session.user}"')
+
+        effective = self._session_effective_roles(session)
+        for group, max_active in self.session_exclusive_groups:
+            activated = effective & group
+            if len(activated) > max_active:
+                raise ValueError(
+                    f"session activates {len(activated)} roles {sorted(activated)} "
+                    f"of a mutually exclusive group that allows at most {max_active}"
+                )
+
     def enforce(self, *rvals):
         """decides whether a "subject" can access a "object" with the operation "action",
         input parameters are usually: (sub, obj, act).
@@ -404,6 +494,11 @@ class CoreEnforcer:
         if not self.enabled:
             return [True, []]
 
+        session = None
+        if len(rvals) != 0 and isinstance(rvals[0], RoleSession):
+            session = rvals[0]
+            rvals = rvals[1:]
+
         functions = self.fm.get_functions()
 
         if "g" in self.model.keys():
@@ -421,6 +516,23 @@ class CoreEnforcer:
                 etype = enforce_context.etype
                 mtype = enforce_context.mtype
                 rvals = rvals[1:]
+
+        if session is None and len(rvals) != 0 and isinstance(rvals[0], RoleSession):
+            session = rvals[0]
+            rvals = rvals[1:]
+
+        if session is not None:
+            try:
+                self._validate_role_session(session)
+            except ValueError as e:
+                self.logger.warning("Request rejected: %s", e)
+                return False, []
+            effective_roles = self._session_effective_roles(session)
+            # copy the function map so the shared one is never mutated per session
+            functions = dict(functions)
+            if "g" in self.model.keys():
+                for key in self.model["g"].keys():
+                    functions[key] = generate_session_g_function(session, effective_roles)
 
         if "m" not in self.model.keys():
             raise RuntimeError("model is undefined")
