@@ -366,6 +366,35 @@ def generate_g_function(rm):
     return f
 
 
+def generate_session_g_function(rm, session):
+    """the factory method of the g(_, _) function scoped to a RoleSession.
+
+    The role manager "rm" only contains links from the session user to the
+    activated roles, so permission lookup follows just those roles and their
+    inheritance. Permissions assigned directly to the session user only apply
+    when the session explicitly allows them.
+    """
+
+    def f(*args):
+        name1 = args[0]
+        name2 = args[1]
+
+        if name1 == name2:
+            if name1 == session.user:
+                return session.allow_direct_permissions
+            return True
+
+        if not rm:
+            return False
+        elif 2 == len(args):
+            return rm.has_link(name1, name2)
+        else:
+            domain = str(args[2])
+            return rm.has_link(name1, name2, domain)
+
+    return f
+
+
 def generate_conditional_g_function(crm):
     """the factory method of the g(_, _[, _]) function with conditions."""
 

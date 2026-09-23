@@ -21,7 +21,14 @@ from casbin.model import Model, FunctionMap
 from casbin.persist import Adapter
 from casbin.persist.adapters import FileAdapter
 from casbin.rbac import default_role_manager
-from casbin.util import generate_g_function, SimpleEval, util, generate_conditional_g_function
+from casbin.session import RoleSession, SessionError
+from casbin.util import (
+    generate_g_function,
+    generate_session_g_function,
+    SimpleEval,
+    util,
+    generate_conditional_g_function,
+)
 from casbin.util.log import configure_logging, disabled_logging
 
 
@@ -58,6 +65,7 @@ class CoreEnforcer:
     auto_save = False
     auto_build_role_links = False
     auto_notify_watcher = False
+    session_mutex_groups = None
 
     def __init__(self, model=None, adapter=None, enable_log=False, logging_config: dict = None):
         self.logger = logging.getLogger("casbin.enforcer")
@@ -118,6 +126,7 @@ class CoreEnforcer:
         self.auto_save = True
         self.auto_build_role_links = True
         self.auto_notify_watcher = True
+        self.session_mutex_groups = []
 
         self.init_rm_map()
 
@@ -383,6 +392,100 @@ class CoreEnforcer:
             mtype="m" + suffix,
         )
 
+    def add_session_role_mutex_group(self, roles, max_active=1):
+        """declares a group of mutually exclusive roles for role sessions.
+
+        A session is rejected when its effective roles (activated roles plus
+        the roles they inherit) contain more than "max_active" roles of the
+        group.
+        """
+        self.session_mutex_groups.append((set(roles), max_active))
+
+    def clear_session_role_mutex_groups(self):
+        """removes all role mutual-exclusion groups used for role sessions."""
+        self.session_mutex_groups = []
+
+    def new_role_session(self, user, roles, domain=None, allow_direct_permissions=False):
+        """creates a role session activating "roles" for "user" (optionally in "domain").
+
+        Every activated role must currently be granted to the user, otherwise a
+        SessionError is raised. Permissions assigned directly to the user are
+        invisible inside the session unless "allow_direct_permissions" is True.
+        Pass the returned session as the first element of "rvals" in
+        "enforce"/"enforce_ex"; requests without a session keep the original
+        RBAC behavior.
+        """
+        session = RoleSession(
+            user=user,
+            roles=roles,
+            domain=domain,
+            allow_direct_permissions=allow_direct_permissions,
+        )
+        self._validate_role_session(session)
+        return session
+
+    def _session_domain_args(self, session):
+        return (session.domain,) if session.domain is not None else ()
+
+    def _session_effective_roles(self, session):
+        """returns the activated roles plus every role reachable via inheritance."""
+        rm = self.rm_map.get("g")
+        domain = self._session_domain_args(session)
+        effective = set(session.roles)
+        queue = list(session.roles)
+        while queue:
+            role = queue.pop()
+            for parent in rm.get_roles(role, *domain):
+                if parent not in effective:
+                    effective.add(parent)
+                    queue.append(parent)
+        return effective
+
+    def _validate_role_session(self, session):
+        """checks a session against the live role graph and the mutex groups."""
+        rm = self.rm_map.get("g")
+        if rm is None:
+            raise SessionError("role sessions require a role definition (g) in the model")
+        if isinstance(rm, default_role_manager.DomainManagerBase) and session.domain is None:
+            raise SessionError("role session requires a domain for a domain-aware model")
+
+        domain = self._session_domain_args(session)
+        for role in session.roles:
+            if not rm.has_link(session.user, role, *domain):
+                where = f" in domain '{session.domain}'" if session.domain is not None else ""
+                raise SessionError(f"role '{role}' is not granted to user '{session.user}'{where}")
+
+        effective = self._session_effective_roles(session)
+        for group, max_active in self.session_mutex_groups:
+            conflicts = sorted(group & effective)
+            if len(conflicts) > max_active:
+                raise SessionError(
+                    f"mutually exclusive roles {conflicts} exceed the limit of {max_active} active role(s)"
+                )
+
+    def _build_session_rm(self, session, ptype="g"):
+        """builds a throwaway role manager holding only the session's activated
+        roles, so concurrent sessions never rewrite the shared role graph."""
+        base = self.rm_map[ptype]
+        if isinstance(base, default_role_manager.DomainManagerBase):
+            scoped = default_role_manager.DomainManager(base.max_hierarchy_level)
+        else:
+            scoped = default_role_manager.RoleManager(base.max_hierarchy_level)
+
+        domain = self._session_domain_args(session)
+        pending = list(session.roles)
+        visited = set(pending)
+        for role in pending:
+            scoped.add_link(session.user, role, *domain)
+        while pending:
+            role = pending.pop()
+            for parent in base.get_roles(role, *domain):
+                scoped.add_link(role, parent, *domain)
+                if parent not in visited:
+                    visited.add(parent)
+                    pending.append(parent)
+        return scoped
+
     def enforce(self, *rvals):
         """decides whether a "subject" can access a "object" with the operation "action",
         input parameters are usually: (sub, obj, act).
@@ -401,6 +504,16 @@ class CoreEnforcer:
         etype = "e"
         mtype = "m"
 
+        session = None
+        if len(rvals) != 0 and isinstance(rvals[0], RoleSession):
+            session = rvals[0]
+            rvals = rvals[1:]
+            try:
+                self._validate_role_session(session)
+            except SessionError as err:
+                self.logger.warning("Request rejected: %s", err)
+                return [False, []]
+
         if not self.enabled:
             return [True, []]
 
@@ -408,6 +521,10 @@ class CoreEnforcer:
 
         if "g" in self.model.keys():
             for key, ast in self.model["g"].items():
+                if session is not None:
+                    if key in self.rm_map:
+                        functions[key] = generate_session_g_function(self._build_session_rm(session, key), session)
+                    continue
                 if len(self.rm_map) != 0:
                     functions[key] = generate_g_function(ast.rm)
                 if len(self.cond_rm_map) != 0:
