@@ -390,6 +390,21 @@ class CoreEnforcer:
         result, _ = self.enforce_ex(*rvals)
         return result
 
+    def preview_enforce(self, *rvals):
+        """previews the enforcement decision for a request in which some
+        attributes may still be unknown.
+
+        Missing attributes are passed as casbin.Unknown markers (None remains
+        a real value). Returns a casbin.PreviewResult with decision "allow",
+        "deny" or "indeterminate"; an indeterminate result lists the fields
+        that must be completed to reach a definite decision. This does not
+        change the boolean enforce() API and must not be used to directly
+        allow requests.
+        """
+        from casbin.preview import preview_enforce
+
+        return preview_enforce(self, *rvals)
+
     def enforce_ex(self, *rvals):
         """decides whether a "subject" can access a "object" with the operation "action",
         input parameters are usually: (sub, obj, act).
