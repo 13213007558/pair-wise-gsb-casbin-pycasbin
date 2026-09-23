@@ -111,6 +111,7 @@ class CoreEnforcer:
     def _initialize(self):
         self.rm_map = dict()
         self.cond_rm_map = dict()
+        self._prejudge_functions = dict()
         self.eft = get_effector(self.model["e"]["e"].value)
         self.watcher = None
 
@@ -389,6 +390,29 @@ class CoreEnforcer:
         """
         result, _ = self.enforce_ex(*rvals)
         return result
+
+    def prejudge(self, *rvals):
+        """prejudges a request whose attributes may be marked as casbin.Unknown.
+
+        Returns a casbin.PrejudgeResult with a three-valued verdict
+        (Verdict.ALLOW, Verdict.DENY or Verdict.INDETERMINATE) instead of a
+        boolean. This is a separate entry point: it never modifies enforce()
+        and its result must not be used to directly allow a request.
+        """
+        from casbin.prejudge import prejudge
+
+        return prejudge(self, *rvals)
+
+    def add_prejudge_function(self, name, func):
+        """registers a function adapter that understands casbin.Unknown.
+
+        Ordinary functions are not executed by prejudge() when an argument
+        is unknown; a function registered here is called even then and may
+        return a concrete value or a casbin.Unknown. The adapter is used by
+        prejudge() in place of the same-named enforce() function, so it must
+        also handle concrete arguments.
+        """
+        self._prejudge_functions[name] = func
 
     def enforce_ex(self, *rvals):
         """decides whether a "subject" can access a "object" with the operation "action",
