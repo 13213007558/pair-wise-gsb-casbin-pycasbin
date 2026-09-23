@@ -1,0 +1,10 @@
+p, 1, data2_admin, domain1, data2, read, allow
+p, 2, alice, domain1, data1, read, deny
+p, 3, data1_admin, domain1, data1, read, allow
+
+g, alice, team_a, domain1, _, _
+g, alice, team_b, domain1, _, _
+g, team_a, data1_admin, domain1, _, _
+g, team_b, data1_admin, domain1, _, _
+g, team_a, data2_admin, domain1, _, _
+g, team_b, data2_admin, domain1, _, _

@@ -103,6 +103,7 @@ class RoleManager(RM):
         self.domain_matching_func = None
         self.all_links = list()
         self.all_roles = dict()
+        self.link_tracer = None
 
     def _rebuild(self):
         self.all_roles = dict()
@@ -190,10 +191,16 @@ class RoleManager(RM):
         if level <= 0 or len(roles) == 0:
             return False
 
+        tracer = self.link_tracer
         next_roles = set()
         for role in roles:
             if name == role.name:
+                if tracer is not None:
+                    tracer.record_found(role.name)
                 return True
+            if tracer is not None:
+                for next_role in role.roles:
+                    tracer.record_edge(role.name, next_role.name)
             next_roles.update(set(role.roles))
 
         return self._has_link(name, list(next_roles), level - 1)
@@ -226,6 +233,7 @@ class DomainManagerBase(RM):
         self.matching_func = None
         self.domain_matching_func = None
         self.matching_func = lambda name1, name2: name1 == name2
+        self.link_tracer = None
 
     def add_matching_func(self, fn):
         self.matching_func = fn
@@ -281,6 +289,8 @@ class DomainManagerBase(RM):
 
     def has_link(self, name1, name2, *domain):
         rm = self._get_role_manager(*domain)
+        if self.link_tracer is not None:
+            rm.link_tracer = self.link_tracer
         return rm.has_link(name1, name2)
 
     def get_roles(self, name, *domain):
@@ -373,6 +383,8 @@ class ConditionalRoleManager(RoleManager, CRM):
     def has_link(self, name1, name2, *domains):
         """determines whether role: name1 inherits role: name2."""
         if name1 == name2 or (self.matching_func is not None and self._matching_fn(name1, name2)):
+            if self.link_tracer is not None:
+                self.link_tracer.record_found(name1)
             return True
 
         user = self._get_role(name1)
@@ -387,15 +399,20 @@ class ConditionalRoleManager(RoleManager, CRM):
         if level < 0 or len(roles) == 0:
             return False
 
+        tracer = self.link_tracer
         next_roles = set()
         for role in roles:
             if target_name == role.name or (
                 self.matching_func is not None and self._matching_fn(role.name, target_name)
             ):
+                if tracer is not None:
+                    tracer.record_found(role.name)
                 return True
 
             for next_role in role.roles:
                 linked_role = self.get_next_roles(role, next_role, domains)
+                if tracer is not None:
+                    tracer.record_edge(role.name, next_role.name, passed=next_role in linked_role)
                 next_roles.update(set(linked_role))
 
         return self._has_link(target_name, next_roles, level - 1, *domains)
@@ -496,6 +513,8 @@ class ConditionalDomainManager(DomainManager, ConditionalRoleManager):
     def has_link(self, name1, name2, *domain):
         domain = self._get_domain(*domain)
         rm = self._get_conditional_role_manager(domain)
+        if self.link_tracer is not None:
+            rm.link_tracer = self.link_tracer
         return rm.has_link(name1, name2, domain)
 
     def add_link(self, name1, name2, *domain):

@@ -17,6 +17,7 @@ import logging
 import re
 
 from casbin.effect import Effector, get_effector, effect_to_bool
+from casbin.explain import EFFECT_LABELS, ExplainRecorder, ExplainableSimpleEval
 from casbin.model import Model, FunctionMap
 from casbin.persist import Adapter
 from casbin.persist.adapters import FileAdapter
@@ -395,24 +396,55 @@ class CoreEnforcer:
         input parameters are usually: (sub, obj, act).
         return judge result with reason
         """
+        return self._enforce(rvals)
 
+    def enforce_explain(self, *rvals, options=None):
+        """decides whether a "subject" can access a "object" with the operation "action",
+        and explains how this very decision was reached.
+
+        Returns (result, explain_rule, report). The first two values follow the
+        same contract as enforce_ex(); report is an ExplainReport describing the
+        policies, role links and effect decisions this call actually went
+        through. "options" is an ExplainOptions selecting which fields appear
+        in the report.
+        """
+        recorder = ExplainRecorder(options)
+        result, explain_rule = self._enforce(rvals, recorder=recorder)
+        return result, explain_rule, recorder.build_report()
+
+    def _enforce(self, rvals, recorder=None):
         rtype = "r"
         ptype = "p"
         etype = "e"
         mtype = "m"
 
         if not self.enabled:
+            if recorder is not None:
+                recorder.record_disabled()
             return [True, []]
 
         functions = self.fm.get_functions()
 
+        g_function_names = []
         if "g" in self.model.keys():
             for key, ast in self.model["g"].items():
+                g_function_names.append(key)
                 if len(self.rm_map) != 0:
                     functions[key] = generate_g_function(ast.rm)
                 if len(self.cond_rm_map) != 0:
                     functions[key] = generate_conditional_g_function(ast.cond_rm)
 
+        if recorder is None:
+            return self._enforce_impl(rvals, recorder, functions, rtype, ptype, etype, mtype)
+
+        functions = recorder.wrap_functions(dict(functions), g_function_names)
+        recorder.attach(self.rm_map, self.cond_rm_map)
+        try:
+            return self._enforce_impl(rvals, recorder, functions, rtype, ptype, etype, mtype)
+        finally:
+            recorder.detach()
+
+    def _enforce_impl(self, rvals, recorder, functions, rtype, ptype, etype, mtype):
         if len(rvals) != 0:
             if isinstance(rvals[0], EnforceContext):
                 enforce_context = rvals[0]
@@ -434,22 +466,30 @@ class CoreEnforcer:
         if len(r_tokens) != len(rvals):
             raise RuntimeError("invalid request size")
 
+        if recorder is not None:
+            recorder.begin_request(r_tokens, rvals)
+
         exp_string = self.model["m"][mtype].value
         exp_has_eval = util.has_eval(exp_string)
         if not exp_has_eval:
-            expression = self._get_expression(exp_string, functions)
+            expression = self._get_expression(exp_string, functions, recorder=recorder)
 
         policy_effects = set()
 
         r_parameters = dict(zip(r_tokens, rvals))
 
         policy_len = len(self.model["p"][ptype].policy)
+        if recorder is not None:
+            recorder.begin_policy_set(policy_len, self.model["p"][ptype].policy)
 
         explain_index = -1
         if not 0 == policy_len:
             for i, pvals in enumerate(self.model["p"][ptype].policy):
                 if len(p_tokens) != len(pvals):
                     raise RuntimeError("invalid policy size")
+
+                if recorder is not None:
+                    recorder.begin_policy(i, pvals)
 
                 p_parameters = dict(zip(p_tokens, pvals))
                 parameters = dict(r_parameters, **p_parameters)
@@ -458,17 +498,21 @@ class CoreEnforcer:
                     rule_names = util.get_eval_value(exp_string)
                     rules = [util.escape_assertion(p_parameters[rule_name]) for rule_name in rule_names]
                     exp_with_rule = util.replace_eval(exp_string, rules)
-                    expression = self._get_expression(exp_with_rule, functions)
+                    expression = self._get_expression(exp_with_rule, functions, recorder=recorder)
 
                 result = expression.eval(parameters)
 
                 if isinstance(result, bool):
                     if not result:
                         policy_effects.add(Effector.INDETERMINATE)
+                        if recorder is not None:
+                            recorder.end_policy(expression, False, EFFECT_LABELS[Effector.INDETERMINATE])
                         continue
                 elif isinstance(result, float):
                     if 0 == result:
                         policy_effects.add(Effector.INDETERMINATE)
+                        if recorder is not None:
+                            recorder.end_policy(expression, False, EFFECT_LABELS[Effector.INDETERMINATE])
                         continue
                 else:
                     raise RuntimeError("matcher result should be bool, int or float")
@@ -478,18 +522,27 @@ class CoreEnforcer:
                     eft = parameters[p_eft_key]
                     if "allow" == eft:
                         policy_effects.add(Effector.ALLOW)
+                        eft_label = EFFECT_LABELS[Effector.ALLOW]
                     elif "deny" == eft:
                         policy_effects.add(Effector.DENY)
+                        eft_label = EFFECT_LABELS[Effector.DENY]
                     else:
                         policy_effects.add(Effector.INDETERMINATE)
+                        eft_label = EFFECT_LABELS[Effector.INDETERMINATE]
                 else:
                     policy_effects.add(Effector.ALLOW)
+                    eft_label = EFFECT_LABELS[Effector.ALLOW]
+
+                if recorder is not None:
+                    recorder.end_policy(expression, True, eft_label)
 
                 # Update explain_index for any matching policy before checking early break condition
                 # to ensure explanations are captured for allow rules in deny models
                 explain_index = i
 
                 if self.eft.intermediate_effect(policy_effects) != Effector.INDETERMINATE:
+                    if recorder is not None:
+                        recorder.record_termination(i, eft_label)
                     break
 
         else:
@@ -501,6 +554,9 @@ class CoreEnforcer:
             for token in self.model["p"][ptype].tokens:
                 parameters[token] = ""
 
+            if recorder is not None:
+                recorder.begin_policy(None, None)
+
             result = expression.eval(parameters)
 
             if result:
@@ -508,8 +564,18 @@ class CoreEnforcer:
             else:
                 policy_effects.add(Effector.INDETERMINATE)
 
+            if recorder is not None:
+                recorder.end_policy(
+                    expression,
+                    bool(result),
+                    EFFECT_LABELS[Effector.ALLOW if result else Effector.INDETERMINATE],
+                )
+
         final_effect = self.eft.final_effect(policy_effects)
         result = effect_to_bool(final_effect)
+
+        if recorder is not None:
+            recorder.finish(EFFECT_LABELS[final_effect], result, self.model["e"][etype].value)
 
         # Log request.
         if (result and self.logger.isEnabledFor(logging.INFO)) or (
@@ -545,9 +611,12 @@ class CoreEnforcer:
         configure_logging(logging_config)
 
     @staticmethod
-    def _get_expression(expr, functions=None):
+    def _get_expression(expr, functions=None, recorder=None):
         expr = expr.replace("&&", "and")
         expr = expr.replace("||", "or")
         expr = re.sub(r"!(?!=)", "not ", expr)
+
+        if recorder is not None:
+            return ExplainableSimpleEval(expr, functions, recorder)
 
         return SimpleEval(expr, functions)
