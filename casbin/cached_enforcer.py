@@ -39,7 +39,23 @@ class CacheSupport:
         self._enable_cache = True
         self._expire_time = None
         self._warned_about_dynamic_model = False
+        self._cache_generation = 0
         super().__init__(*args, **kwargs)
+        # align with whatever generation the constructor finished on (still version 0 for
+        # a freshly built enforcer) without flushing entries that were just computed.
+        self._cache_generation = self.state.version
+
+    def on_state_published(self, old_state, new_state):
+        super().on_state_published(old_state, new_state)
+        if not hasattr(self, "_cache"):
+            # construction publishes states before CacheSupport.__init__ finishes
+            return
+        # only a real generation change makes cached decisions obsolete. State replacements
+        # that keep the same version (construction bookkeeping, or a reload that never
+        # published) must not flush decisions that are still valid.
+        if new_state.version != self._cache_generation:
+            self._cache_generation = new_state.version
+            self.invalidate_cache()
 
     def enable_cache(self, enable_cache):
         """turns the decision cache on or off. Turning it off also drops what is cached,
@@ -138,8 +154,13 @@ class CacheSupport:
             # caller mutating it would corrupt both the cache and the model.
             return result, list(explain)
 
+        # remember the state this decision is computed against. If a reload publishes a new
+        # state while the decision is in flight, the answer belongs to the old generation
+        # and must not be cached where a post-reload request could pick it up.
+        generation = self.state.version
         result, explain = super().enforce_ex(*rvals)
-        self._cache.set(key, (result, tuple(explain)), self._expire_time)
+        if generation == self._cache_generation:
+            self._cache.set(key, (result, tuple(explain)), self._expire_time)
         return result, explain
 
     # Everything below invalidates the cache after letting the enforcer do its work.

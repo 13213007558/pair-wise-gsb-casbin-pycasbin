@@ -97,6 +97,21 @@ class PolicyIndex:
             self._bucket_ids = []
             self._names = {}
 
+    def snapshot(self):
+        """returns an independent copy of this index's currently built buckets.
+
+        A policy state keeps its own snapshot, so rebuilding the buckets for a newly
+        published policy can never mutate the partition a request still in flight is
+        iterating over.
+        """
+        with self._lock:
+            clone = PolicyIndex(self.request_key, self.policy_key)
+            clone._built = self._built
+            clone._version = self._version
+            clone._bucket_ids = list(self._bucket_ids)
+            clone._names = dict(self._names)
+            return clone
+
 
 def policy_matches_bucket(bucket_ids, policy_index, bucket):
     if policy_index < 0 or policy_index >= len(bucket_ids):

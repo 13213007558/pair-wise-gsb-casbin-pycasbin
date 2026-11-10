@@ -15,6 +15,7 @@ import copy
 import inspect
 
 from casbin.core_enforcer import CoreEnforcer
+from casbin.hot_reload import PolicyState, ReloadResult
 from casbin.model import Model, FunctionMap
 from casbin.persist.adapters.asyncio import AsyncFileAdapter, AsyncAdapter
 
@@ -77,6 +78,45 @@ class AsyncInternalEnforcer(CoreEnforcer):
                 self.build_role_links()
 
             raise e
+
+    async def hot_load_policy(self, notify_watcher=True):
+        """asynchronous counterpart of CoreEnforcer.hot_load_policy with the same
+        atomicity guarantees. The candidate is read and fully prepared off to the side;
+        a failure leaves the current state in place and is reported on the ReloadResult."""
+        old_state = self._state
+        from casbin.hot_reload import PolicyState
+
+        candidate = PolicyState.build_candidate(old_state, old_state.model)
+
+        try:
+            await self.adapter.load_policy(candidate.model)
+            candidate.validate_rule_shapes()
+
+            candidate.model.sort_policies_by_subject_hierarchy()
+            candidate.model.sort_policies_by_priority()
+            candidate.model.print_policy()
+
+            candidate.build_role_links(self.auto_build_role_links)
+            candidate.prepare_indexes()
+        except Exception as error:
+            return ReloadResult(False, old_state.version, error)
+
+        self._publish_state(candidate)
+
+        if notify_watcher and self.watcher is not None:
+            update_for_save_policy = getattr(self.watcher, "update_for_save_policy", None)
+            if callable(update_for_save_policy):
+                if inspect.iscoroutinefunction(update_for_save_policy):
+                    await update_for_save_policy(candidate.model)
+                else:
+                    update_for_save_policy(candidate.model)
+            elif callable(getattr(self.watcher, "update", None)):
+                if inspect.iscoroutinefunction(self.watcher.update):
+                    await self.watcher.update()
+                else:
+                    self.watcher.update()
+
+        return ReloadResult(True, candidate.version)
 
     async def load_filtered_policy(self, filter):
         """async reloads a filtered policy from file/database."""

@@ -15,6 +15,7 @@
 import copy
 import logging
 import re
+import threading
 from functools import lru_cache
 
 from casbin.effect import (
@@ -23,6 +24,7 @@ from casbin.effect import (
     effect_to_bool,
     get_effector,
 )
+from casbin.hot_reload import PolicyState, ReloadResult
 from casbin.model import Model, FunctionMap
 from casbin.persist import Adapter
 from casbin.persist.adapters import FileAdapter
@@ -52,14 +54,10 @@ class CoreEnforcer:
     """CoreEnforcer defines the core functionality of an enforcer."""
 
     model_path = ""
-    model = None
     fm = None
-    eft = None
 
     adapter = None
     watcher = None
-    rm_map = None
-    cond_rm_map = None
 
     enabled = False
     auto_save = False
@@ -68,8 +66,13 @@ class CoreEnforcer:
 
     def __init__(self, model=None, adapter=None, enable_log=False, logging_config: dict = None):
         self.logger = logging.getLogger("casbin.enforcer")
+        # _state is the one swappable pointer. Everything that depends on the loaded
+        # policy (model, role graphs, effector, per-policy caches) lives inside the state
+        # it points at, and _state_lock makes publishing a candidate one atomic step.
+        self._state = None
+        self._state_lock = threading.RLock()
+        self._next_version = 0
         self._policy_indexes = {}
-        self._policy_deny_cache = {}
         if isinstance(model, str):
             if isinstance(adapter, str):
                 self.init_with_file(model, adapter)
@@ -86,6 +89,83 @@ class CoreEnforcer:
             configure_logging(logging_config)
         else:
             disabled_logging()
+
+    @property
+    def state(self):
+        """the immutable policy state currently being served."""
+        return self._state
+
+    @property
+    def model(self):
+        return self._state.model
+
+    @model.setter
+    def model(self, model):
+        # used during construction and by load_model()/set_model(); swap the whole state
+        # so the role graphs and effector never lag behind the model by half a step.
+        self._replace_state(model=model)
+
+    @property
+    def rm_map(self):
+        return self._state.rm_map
+
+    @rm_map.setter
+    def rm_map(self, rm_map):
+        self._replace_state(rm_map=rm_map)
+
+    @property
+    def cond_rm_map(self):
+        return self._state.cond_rm_map
+
+    @cond_rm_map.setter
+    def cond_rm_map(self, cond_rm_map):
+        self._replace_state(cond_rm_map=cond_rm_map)
+
+    @property
+    def eft(self):
+        return self._state.eft
+
+    @eft.setter
+    def eft(self, eft):
+        self._replace_state(eft=eft)
+
+    @property
+    def _policy_deny_cache(self):
+        return self._state.policy_deny_cache
+
+    def _replace_state(self, **changes):
+        """publishes a new state derived from the current one with the given fields
+        replaced, and hands any old state to subclasses for invalidation."""
+        with self._state_lock:
+            old_state = self._state
+            if old_state is None:
+                new_state = PolicyState(
+                    changes.get("model"),
+                    changes.get("rm_map", {}),
+                    changes.get("cond_rm_map", {}),
+                    changes.get("eft"),
+                    self._policy_indexes,
+                    self._next_version,
+                )
+                self._next_version += 1
+            else:
+                new_state = PolicyState(
+                    changes.get("model", old_state.model),
+                    changes.get("rm_map", old_state.rm_map),
+                    changes.get("cond_rm_map", old_state.cond_rm_map),
+                    changes.get("eft", old_state.eft),
+                    self._policy_indexes,
+                    old_state.version,
+                )
+            self._state = new_state
+            if old_state is not new_state:
+                self.on_state_published(old_state, new_state)
+            return new_state
+
+    def on_state_published(self, old_state, new_state):
+        """hook called after every state publication. Subclasses (the decision cache)
+        override it so pre-publication data cannot authorize post-publication requests."""
+        pass
 
     def init_with_file(self, model_path, policy_path):
         """initializes an enforcer with a model file and a policy file."""
@@ -209,6 +289,7 @@ class CoreEnforcer:
         if "p" not in self.model.keys() or ptype not in self.model["p"]:
             raise ValueError(f"policy type {ptype!r} does not exist")
         self._policy_indexes[ptype] = index
+        self._state.policy_indexes[ptype] = index.snapshot()
 
     def set_policy_index_by_token(self, ptype, request_token, policy_token):
         """partitions ptype's rules by the string value of two tokens.
@@ -248,15 +329,14 @@ class CoreEnforcer:
     def remove_policy_index(self, ptype):
         """removes the policy partition for ptype."""
         self._policy_indexes.pop(ptype, None)
+        self._state.policy_indexes.pop(ptype, None)
 
     def _reset_policy_caches(self):
-        for index in self._policy_indexes.values():
-            index.reset()
-        self._policy_deny_cache.clear()
+        self._state.policy_deny_cache.clear()
 
-    def _policy_has_deny(self, ptype, p_tokens):
-        assertion = self.model["p"][ptype]
-        cached = self._policy_deny_cache.get(ptype)
+    def _state_policy_has_deny(self, state, ptype, p_tokens):
+        assertion = state.model["p"][ptype]
+        cached = state.policy_deny_cache.get(ptype)
         if cached is not None and cached[0] == assertion.policy_version and cached[1] == len(assertion.policy):
             return cached[2], cached[3]
 
@@ -270,7 +350,7 @@ class CoreEnforcer:
             if eft_index != -1 and eft_index < len(rule) and rule[eft_index] == "deny":
                 has_deny = True
 
-        self._policy_deny_cache[ptype] = (
+        state.policy_deny_cache[ptype] = (
             assertion.policy_version,
             len(assertion.policy),
             has_deny,
@@ -365,6 +445,52 @@ class CoreEnforcer:
                 self.build_role_links()
 
             raise e
+
+    def hot_load_policy(self, notify_watcher=True):
+        """atomically reloads the policy without taking any request offline.
+
+        The candidate policy is read from the adapter into a brand-new state and fully
+        prepared there -- rule shape check, role inheritance graph and policy indexes --
+        while the current state keeps serving. Only when every step succeeds is the state
+        pointer swapped in one locked step; any failure leaves the current state in place
+        and is returned as the error on the ReloadResult instead of being raised.
+        """
+        old_state = self._state
+        candidate = PolicyState.build_candidate(old_state, old_state.model)
+
+        try:
+            self.adapter.load_policy(candidate.model)
+            candidate.validate_rule_shapes()
+
+            candidate.model.sort_policies_by_subject_hierarchy()
+            candidate.model.sort_policies_by_priority()
+            candidate.model.print_policy()
+
+            candidate.build_role_links(self.auto_build_role_links)
+            candidate.prepare_indexes()
+        except Exception as error:
+            return ReloadResult(False, old_state.version, error)
+
+        self._publish_state(candidate)
+
+        if notify_watcher and self.watcher is not None:
+            update_for_save_policy = getattr(self.watcher, "update_for_save_policy", None)
+            if callable(update_for_save_policy):
+                update_for_save_policy(candidate.model)
+            elif callable(getattr(self.watcher, "update", None)):
+                self.watcher.update()
+
+        return ReloadResult(True, candidate.version)
+
+    def _publish_state(self, candidate):
+        """swaps a fully prepared candidate in as the current state. The version bump is
+        the only write a decision cache needs to see to know its entries are obsolete."""
+        with self._state_lock:
+            old_state = self._state
+            candidate.version = self._next_version
+            self._next_version += 1
+            self._state = candidate
+            self.on_state_published(old_state, candidate)
 
     def load_filtered_policy(self, filter):
         """reloads a filtered policy from file/database."""
@@ -504,11 +630,26 @@ class CoreEnforcer:
         result, _ = self.enforce_ex(*rvals)
         return result
 
+    def enforce_ex_on_state(self, state, *rvals):
+        """decides a request against an explicit, already-captured policy state.
+
+        Useful for a request that snapshots state once at entry and must keep evaluating
+        that same snapshot even if hot_load_policy() publishes a newer one before it
+        finishes. Returns the same (result, explain_rule) pair as enforce_ex().
+        """
+        return self._enforce_ex_on_state(state, rvals)
+
     def enforce_ex(self, *rvals):
         """decides whether a "subject" can access a "object" with the operation "action",
         input parameters are usually: (sub, obj, act).
         return judge result with reason
         """
+        return self._enforce_ex_on_state(self._state, rvals)
+
+    def _enforce_ex_on_state(self, state, rvals):
+        """evaluates one request against one fixed state. enforce_ex() binds to the state
+        currently published; callers that need to keep deciding against a captured state
+        across a reload go through here directly."""
 
         rtype = "r"
         ptype = "p"
@@ -518,11 +659,17 @@ class CoreEnforcer:
         if not self.enabled:
             return [True, []]
 
+        # the state is fixed for the whole decision: a hot reload swapping the pointer
+        # mid-request can neither change the rules under evaluation nor pair a new policy
+        # with an old role graph.
+        model = state.model
+        eft = state.eft
+
         functions = self.fm.get_functions()
 
-        if "g" in self.model.keys():
-            for key, ast in self.model["g"].items():
-                if len(self.rm_map) != 0:
+        if "g" in model.keys():
+            for key, ast in model["g"].items():
+                if len(state.rm_map) != 0:
                     functions[key] = generate_g_function(ast.rm)
                 if ast.cond_rm is not None:
                     functions[key] = generate_conditional_g_function(ast.cond_rm)
@@ -536,19 +683,19 @@ class CoreEnforcer:
                 mtype = enforce_context.mtype
                 rvals = rvals[1:]
 
-        if "m" not in self.model.keys():
+        if "m" not in model.keys():
             raise RuntimeError("model is undefined")
 
-        if "m" not in self.model["m"].keys():
+        if "m" not in model["m"].keys():
             raise RuntimeError("model is undefined")
 
-        r_tokens = self.model["r"][rtype].tokens
-        p_tokens = self.model["p"][ptype].tokens
+        r_tokens = model["r"][rtype].tokens
+        p_tokens = model["p"][ptype].tokens
 
         if len(r_tokens) != len(rvals):
             raise RuntimeError("invalid request size")
 
-        exp_string = self.model["m"][mtype].value
+        exp_string = model["m"][mtype].value
         exp_has_eval = util.has_eval(exp_string)
         expression = self._get_expression("" if exp_has_eval else exp_string, functions)
         if exp_has_eval:
@@ -558,25 +705,26 @@ class CoreEnforcer:
 
         r_parameters = dict(zip(r_tokens, rvals))
 
-        policy_len = len(self.model["p"][ptype].policy)
+        policy = model["p"][ptype].policy
+        policy_len = len(policy)
 
-        policy_index = self._policy_indexes.get(ptype)
+        policy_index = state.policy_indexes.get(ptype)
         bucket_ids = None
         request_bucket = 0
         use_policy_index = False
         if policy_index is not None:
-            bucket_ids = policy_index.ensure_built(self.model["p"][ptype])
+            bucket_ids = policy_index.ensure_built(model["p"][ptype])
             request_bucket, use_policy_index = policy_index.request_bucket(rvals)
 
         shortcut_allow_and_deny = False
-        if policy_len != 0 and type(self.eft) is AllowAndDenyEffector:
-            has_deny, all_valid = self._policy_has_deny(ptype, p_tokens)
+        if policy_len != 0 and type(eft) is AllowAndDenyEffector:
+            has_deny, all_valid = self._state_policy_has_deny(state, ptype, p_tokens)
             shortcut_allow_and_deny = all_valid and not has_deny
 
         explain_index = -1
         allow_index = -1
         if not 0 == policy_len:
-            for i, pvals in enumerate(self.model["p"][ptype].policy):
+            for i, pvals in enumerate(policy):
                 if len(p_tokens) != len(pvals):
                     raise RuntimeError("invalid policy size")
 
@@ -605,10 +753,10 @@ class CoreEnforcer:
 
                 p_eft_key = ptype + "_eft"
                 if p_eft_key in parameters.keys():
-                    eft = parameters[p_eft_key]
-                    if "allow" == eft:
+                    p_eft = parameters[p_eft_key]
+                    if "allow" == p_eft:
                         policy_effects.add(Effector.ALLOW)
-                    elif "deny" == eft:
+                    elif "deny" == p_eft:
                         policy_effects.add(Effector.DENY)
                     else:
                         policy_effects.add(Effector.INDETERMINATE)
@@ -622,7 +770,7 @@ class CoreEnforcer:
                     explain_index = i
                     break
 
-                if self.eft.intermediate_effect(policy_effects) != Effector.INDETERMINATE:
+                if eft.intermediate_effect(policy_effects) != Effector.INDETERMINATE:
                     explain_index = i
                     break
 
@@ -632,7 +780,7 @@ class CoreEnforcer:
 
             parameters = r_parameters.copy()
 
-            for token in self.model["p"][ptype].tokens:
+            for token in model["p"][ptype].tokens:
                 parameters[token] = ""
 
             result = expression.eval(parameters)
@@ -642,9 +790,9 @@ class CoreEnforcer:
             else:
                 policy_effects.add(Effector.INDETERMINATE)
 
-        final_effect = self.eft.final_effect(policy_effects)
+        final_effect = eft.final_effect(policy_effects)
         result = effect_to_bool(final_effect)
-        if explain_index == -1 and final_effect == Effector.ALLOW and isinstance(self.eft, AllowAndDenyEffector):
+        if explain_index == -1 and final_effect == Effector.ALLOW and isinstance(eft, AllowAndDenyEffector):
             explain_index = allow_index
 
         # Log request.
@@ -663,7 +811,7 @@ class CoreEnforcer:
 
         explain_rule = []
         if explain_index != -1 and explain_index < policy_len:
-            explain_rule = self.model["p"][ptype].policy[explain_index]
+            explain_rule = policy[explain_index]
 
         return result, explain_rule
 

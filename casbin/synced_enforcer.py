@@ -191,6 +191,17 @@ class SyncedEnforcer:
         with self._rl:
             return self._e.get_model()
 
+    @property
+    def state(self):
+        """the immutable policy state currently being served."""
+        with self._rl:
+            return self._e.state
+
+    def enforce_ex_on_state(self, state, *rvals):
+        """decides a request against an explicit, already-captured policy state."""
+        with self._rl:
+            return self._e.enforce_ex_on_state(state, *rvals)
+
     def set_model(self, m):
         """sets the current model."""
         with self._wl:
@@ -251,6 +262,19 @@ class SyncedEnforcer:
         """reloads the policy from file/database."""
         with self._wl:
             return self._e.load_policy()
+
+    def hot_load_policy(self, notify_watcher=True):
+        """atomically swaps in a freshly loaded policy without blocking requests while the
+        adapter is read.
+
+        The candidate policy is read and fully prepared outside the write lock, so
+        enforce() calls keep being served from the current state the whole time. Only the
+        final pointer swap takes the lock, and the watcher is notified afterwards -- and
+        only when a state was actually published.
+        """
+        # the watcher, if set, is the deferring proxy installed by set_watcher(), so a
+        # notification raised inside the swap is still delivered after the lock is released
+        return self._e.hot_load_policy(notify_watcher=notify_watcher)
 
     def load_filtered_policy(self, filter):
         """ "reloads a filtered policy from file/database."""
