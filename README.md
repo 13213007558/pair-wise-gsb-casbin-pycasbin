@@ -270,6 +270,68 @@ asyncio.run(main())
 
 4. Please refer to the ``tests`` files for more usage.
 
+## Offline policy change preview
+
+Before rolling out a new policy, use `preview_policy_change` to see how a finite
+sample of requests would change. The old and new policies are each evaluated in
+a separate, in-memory `Enforcer` built from text (model + CSV-like policy), so
+the preview never reads or writes an online adapter and never notifies a
+watcher. Model, role inheritance (including transitive and domain-scoped
+links) and policy priority all participate in the decisions.
+
+```python
+from casbin import preview_policy_change
+
+model = """
+[request_definition]
+r = sub, obj, act
+[policy_definition]
+p = sub, obj, act
+[role_definition]
+g = _, _
+[policy_effect]
+e = some(where (p.eft == allow))
+[matchers]
+m = g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act
+"""
+
+old_policy = """
+p, alice, data1, read
+g, alice, data1_owner
+"""
+new_policy = """
+p, alice, data1, read
+p, alice, data1, write
+g, alice, data1_owner
+"""
+
+report = preview_policy_change(
+    old_policy,
+    new_policy,
+    [("alice", "data1", "read"), ("alice", "data1", "write")],
+    model=model,
+)
+```
+
+Each changed request is reported with its old/new decision and the evidence
+behind it: the decisive rule (with its index, effect and priority), the
+subject's role chain, the grouping (`g`) rules and the candidate policies that
+mention the subject or its roles. Requests whose decision does not change are
+aggregated under `unchanged`. Changes are grouped into three kinds:
+
+- `added_allow` (新增允许): denied by the old policy, allowed by the new one.
+- `withdrawn_denial` (撤回拒绝): allowed by the old policy, denied by the new one.
+- `priority_only` (仅调整优先级): the decision is unchanged but the decisive
+  rule changed because of policy priority.
+
+Custom matcher functions must be supplied explicitly as pure callables; no
+state is borrowed from a live `Enforcer` (passing one in is rejected). If a
+function raises or is declared as depending on external state, or a policy or
+model cannot be loaded, the report comes back with
+`status = "unreliable"` and the reasons in `unreliable_reasons` instead of a
+misleading comparison. The conclusion only covers the provided sample —
+`scope_note` states that the two policies are not claimed to be equivalent.
+
 ## Benchmarks
 
 https://casbin.apache.org/docs/benchmark/
