@@ -120,16 +120,27 @@ class CacheSupport:
             )
         return True
 
-    def enforce_ex(self, *rvals):
+    def enable_restricted_matcher(self, enabled=True, policy=None):
+        try:
+            return super().enable_restricted_matcher(enabled, policy)
+        finally:
+            self.invalidate_cache()
+
+    def set_restriction_policy(self, policy):
+        try:
+            return super().set_restriction_policy(policy)
+        finally:
+            self.invalidate_cache()
+
+    def enforce_ex(self, *rvals, **kwargs):
         """decides whether a "subject" can access a "object" with the operation "action",
         serving the answer from the cache when the same request was decided before.
         """
         if not self._enable_cache or self._cache_would_be_stale():
-            return super().enforce_ex(*rvals)
-
+            return super().enforce_ex(*rvals, **kwargs)
         key = self.get_cache_key(*rvals)
         if key is None:
-            return super().enforce_ex(*rvals)
+            return super().enforce_ex(*rvals, **kwargs)
 
         cached = self._cache.get(key, _MISSING)
         if cached is not _MISSING:
@@ -138,8 +149,12 @@ class CacheSupport:
             # caller mutating it would corrupt both the cache and the model.
             return result, list(explain)
 
-        result, explain = super().enforce_ex(*rvals)
-        self._cache.set(key, (result, tuple(explain)), self._expire_time)
+        result, explain = super().enforce_ex(*rvals, **kwargs)
+        # A restricted-matcher violation denies the request, but caching it would
+        # replay the denial on later identical requests without re-evaluating and
+        # would hide the recorded violation. Never cache such outcomes.
+        if self.get_last_restriction_violation() is None:
+            self._cache.set(key, (result, tuple(explain)), self._expire_time)
         return result, explain
 
     # Everything below invalidates the cache after letting the enforcer do its work.

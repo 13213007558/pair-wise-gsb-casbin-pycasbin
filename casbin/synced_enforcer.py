@@ -273,13 +273,43 @@ class SyncedEnforcer:
         with self._rl:
             return self._e.enforce(*rvals)
 
-    def enforce_ex(self, *rvals):
+    def enforce_ex(self, *rvals, **kwargs):
         """decides whether a "subject" can access a "object" with the operation "action",
         input parameters are usually: (sub, obj, act).
         return judge result with reason
         """
         with self._rl:
-            return self._e.enforce_ex(*rvals)
+            return self._e.enforce_ex(*rvals, **kwargs)
+
+    def enforce_strict(self, *rvals):
+        """restricted enforce that raises the RestrictionViolation instead of denying."""
+        with self._rl:
+            return self._e.enforce_strict(*rvals)
+
+    def enable_restricted_matcher(self, enabled=True, policy=None):
+        """opt in to (or out of) the restricted matcher strategy on the wrapped enforcer."""
+        with self._wl:
+            return self._e.enable_restricted_matcher(enabled, policy)
+
+    def set_restriction_policy(self, policy):
+        """enables restricted matchers with an explicit restriction policy."""
+        with self._wl:
+            return self._e.set_restriction_policy(policy)
+
+    def get_restriction_policy(self):
+        """returns the wrapped enforcer's active restriction policy."""
+        with self._rl:
+            return self._e.get_restriction_policy()
+
+    def get_last_restriction_violation(self):
+        """returns the violation recorded by the most recent restricted enforce."""
+        with self._rl:
+            return self._e.get_last_restriction_violation()
+
+    def get_last_enforce_budget(self):
+        """returns the budget consumed by the most recent restricted enforce."""
+        with self._rl:
+            return self._e.get_last_enforce_budget()
 
     def batch_enforce(self, rvals):
         """batch_enforce enforce in batches,

@@ -270,6 +270,73 @@ asyncio.run(main())
 
 4. Please refer to the ``tests`` files for more usage.
 
+## Restricted matchers for tenant expressions
+
+When tenants may submit part of a matcher, the default evaluator is unsafe: it
+exposes every registered function and the full Python expression grammar, so a
+tenant could call an internal function or build an expensive expression. The
+restricted matcher strategy is an explicit opt-in layer built on the same
+`simpleeval`/`ast` dependencies (no sandbox service) that limits the grammar,
+the request/policy field names and the callable functions, and charges every
+evaluated node and controlled function call against a per-enforce budget.
+
+```python
+from casbin import Enforcer, util
+
+enforcer = Enforcer("model.conf", "policy.csv")
+
+# Opt in. The minimal policy allows only the model's flat r_*/p_* fields and
+# the side-effect free keyMatch / regexMatch / globMatch functions.
+enforcer.enable_restricted_matcher()
+# or supply an explicit policy:
+# enforcer.set_restriction_policy(
+#     util.RestrictionPolicy.from_enforcer(
+#         enforcer,
+#         node_budget=200,          # evaluated AST nodes per enforce
+#         call_budget=20,           # controlled function calls per enforce
+#         allow_attribute_access=False,
+#     )
+# )
+
+enforcer.enforce("alice", "data1", "read")
+```
+
+Every violation fails closed (the request is denied, never allowed). The reason
+is distinguishable both by return value and by exception type:
+
+```python
+if not enforcer.enforce("alice", "data1", "read"):
+    violation = enforcer.get_last_restriction_violation()
+    type(violation)  # RestrictedNameError | RestrictedAttributeError |
+                     # RestrictedFunctionError | RestrictedSyntaxError |
+                     # NodeBudgetExhausted | CallBudgetExhausted
+
+# Or let it raise instead of returning False:
+enforcer.enforce_strict("alice", "data1", "read")
+```
+
+Guarantees and boundaries:
+
+- **Static validation** runs before evaluation, so unknown names, forbidden
+  attribute access, forbidden functions and disallowed grammar are rejected
+  without executing anything.
+- **`eval(p...)` is fully checked.** The outer matcher and the expanded policy
+  expression produced for each candidate rule are both validated; a forbidden
+  name, attribute or function hidden inside a policy rule is denied too.
+- **Boolean short-circuit is preserved.** A branch that is not evaluated is not
+  charged and cannot invoke a side-effecting function.
+- **Budgets are per request.** One budget accumulates across all candidate
+  rules of a single enforce call and is reset on the next request; requests
+  never share counters.
+- The budget is a pure-Python node/call counter. The wall-clock time spent
+  inside a trusted custom callback is outside this guarantee; no thread timeout
+  is used to pretend an arbitrary callback can be terminated.
+
+A ready-to-use minimal model lives at
+`examples/restricted_matcher_minimal_policy.conf` and an end-to-end demo at
+`examples/restricted_matcher_example.py`. See
+`tests/util/test_restricted_matcher.py` for the full behavior contract.
+
 ## Benchmarks
 
 https://casbin.apache.org/docs/benchmark/

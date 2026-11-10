@@ -30,6 +30,11 @@ from casbin.policy_index import PolicyIndex, policy_matches_bucket
 from casbin.rbac import default_role_manager
 from casbin.util import generate_g_function, SimpleEval, util, generate_conditional_g_function, key_match
 from casbin.util.log import configure_logging, disabled_logging
+from casbin.util.restricted import (
+    RestrictionPolicy,
+    RestrictionViolation,
+    RestrictedSimpleEval,
+)
 
 
 class EnforceContext:
@@ -70,6 +75,9 @@ class CoreEnforcer:
         self.logger = logging.getLogger("casbin.enforcer")
         self._policy_indexes = {}
         self._policy_deny_cache = {}
+        self._restriction_policy = None
+        self.last_restriction_violation = None
+        self._last_enforce_budget = None
         if isinstance(model, str):
             if isinstance(adapter, str):
                 self.init_with_file(model, adapter)
@@ -416,6 +424,56 @@ class CoreEnforcer:
 
         self.enabled = enabled
 
+    def enable_restricted_matcher(self, enabled=True, policy=None):
+        """opt in to (or out of) the restricted matcher strategy.
+
+        When enabled, every matcher evaluated by :meth:`enforce` is checked
+        against ``policy`` (a :class:`RestrictionPolicy`).  Unknown names,
+        forbidden attribute access, forbidden functions/calls and exhausted
+        per-enforce budgets all produce a denial instead of an allow.  When
+        ``policy`` is None a minimal policy is derived from the model tokens and
+        the registered side-effect free functions.
+        """
+        if not enabled:
+            self._restriction_policy = None
+            return
+        self._restriction_policy = (
+            policy if isinstance(policy, RestrictionPolicy) else RestrictionPolicy.from_enforcer(self)
+        )
+
+    def set_restriction_policy(self, policy):
+        """enables restricted matchers with an explicit restriction policy."""
+        if not isinstance(policy, RestrictionPolicy):
+            raise TypeError("policy must be a casbin RestrictionPolicy")
+        self._restriction_policy = policy
+
+    def get_restriction_policy(self):
+        """returns the active restriction policy, or None when not restricted."""
+        return self._restriction_policy
+
+    def get_last_restriction_violation(self):
+        """returns the violation recorded by the most recent restricted enforce.
+
+        Cleared at the start of every enforce call, so a non-None value always
+        belongs to the latest request and explains why it was denied.
+        """
+        return self.last_restriction_violation
+
+    def get_last_enforce_budget(self):
+        """returns the budget consumed by the most recent restricted enforce.
+
+        Returns None when the restricted matcher strategy is disabled.  The
+        counters cover every candidate rule of that one request and are reset on
+        the next request.
+        """
+        return self._last_enforce_budget
+
+    def enforce_strict(self, *rvals):
+        """like :meth:`enforce`, but raises the :class:`RestrictionViolation`
+        instead of converting it into a plain False denial."""
+        result, explain = self.enforce_ex(*rvals, raise_restriction_violation=True)
+        return result
+
     def enable_auto_save(self, auto_save):
         """controls whether to save a policy rule automatically to the adapter when it is added or removed."""
         self.auto_save = auto_save
@@ -504,10 +562,17 @@ class CoreEnforcer:
         result, _ = self.enforce_ex(*rvals)
         return result
 
-    def enforce_ex(self, *rvals):
+    def enforce_ex(self, *rvals, raise_restriction_violation=False):
         """decides whether a "subject" can access a "object" with the operation "action",
         input parameters are usually: (sub, obj, act).
         return judge result with reason
+
+        When the restricted matcher strategy is enabled, any
+        :class:`RestrictionViolation` (unknown name, forbidden attribute/function
+        or exhausted budget) fails closed: the request is denied and the
+        violation is exposed through :meth:`get_last_restriction_violation`.
+        With ``raise_restriction_violation`` the original violation is raised
+        instead so callers can distinguish the rejection reasons.
         """
 
         rtype = "r"
@@ -518,6 +583,19 @@ class CoreEnforcer:
         if not self.enabled:
             return [True, []]
 
+        self.last_restriction_violation = None
+        self._last_enforce_budget = None
+        restriction = self._restriction_policy
+        try:
+            return self._enforce(rvals, rtype, ptype, etype, mtype, restriction)
+        except RestrictionViolation as violation:
+            self.last_restriction_violation = violation
+            if raise_restriction_violation:
+                raise
+            self.logger.warning("restricted matcher rejected request: %s", violation)
+            return False, []
+
+    def _enforce(self, rvals, rtype, ptype, etype, mtype, restriction):
         functions = self.fm.get_functions()
 
         if "g" in self.model.keys():
@@ -550,7 +628,20 @@ class CoreEnforcer:
 
         exp_string = self.model["m"][mtype].value
         exp_has_eval = util.has_eval(exp_string)
-        expression = self._get_expression("" if exp_has_eval else exp_string, functions)
+        if restriction is not None:
+            # The policy already binds each allowed name to its callable, so this
+            # evaluator can only resolve allow-listed functions regardless of
+            # what else has been registered on the enforcer.  A fresh budget
+            # lives for this whole request and accumulates across every
+            # candidate rule.
+            budget = restriction.new_budget()
+            self._last_enforce_budget = budget
+            expression = RestrictedSimpleEval(restriction, budget, functions=dict(restriction.functions))
+            if not exp_has_eval:
+                expression.set_expr(self._normalize_expression(exp_string))
+        else:
+            budget = None
+            expression = self._get_expression("" if exp_has_eval else exp_string, functions)
         if exp_has_eval:
             rule_names = util.get_eval_value(exp_string)
 

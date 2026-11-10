@@ -15,3 +15,17 @@
 from .builtin_operators import *
 from .expression import *
 from .util import *
+
+from .restricted import (
+    EnforceBudget,
+    RestrictedSimpleEval,
+    RestrictionPolicy,
+    RestrictionViolation,
+    RestrictedSyntaxError,
+    RestrictedNameError,
+    RestrictedAttributeError,
+    RestrictedFunctionError,
+    NodeBudgetExhausted,
+    CallBudgetExhausted,
+    validate_expression,
+)
