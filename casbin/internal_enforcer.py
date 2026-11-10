@@ -25,6 +25,8 @@ class InternalEnforcer(CoreEnforcer):
         if self.model.has_policy(sec, ptype, rule):
             return False
 
+        self._guard_filtered_write(sec, ptype, [rule], capability="add_policy")
+
         if self.adapter and self.auto_save:
             if self.adapter.add_policy(sec, ptype, rule) is False:
                 return False
@@ -45,6 +47,8 @@ class InternalEnforcer(CoreEnforcer):
             if self.model.has_policy(sec, ptype, rule):
                 return False
 
+        self._guard_filtered_write(sec, ptype, rules, capability="add_policies")
+
         if self.adapter and self.auto_save:
             if hasattr(self.adapter, "add_policies") is False:
                 return False
@@ -64,6 +68,8 @@ class InternalEnforcer(CoreEnforcer):
 
     def _add_policies_ex(self, sec, ptype, rules):
         """adds rules to the current policy."""
+        self._guard_filtered_write(sec, ptype, rules, capability="add_policies_ex")
+
         if self.adapter and self.auto_save:
             if hasattr(self.adapter, "add_policies_ex") is False:
                 return False
@@ -83,6 +89,10 @@ class InternalEnforcer(CoreEnforcer):
 
     def _update_policy(self, sec, ptype, old_rule, new_rule):
         """updates a rule from the current policy."""
+        self._guard_filtered_write(
+            sec, ptype, [old_rule, new_rule], capability="update_policy"
+        )
+
         rule_updated = self.model.update_policy(sec, ptype, old_rule, new_rule)
 
         if not rule_updated:
@@ -99,6 +109,11 @@ class InternalEnforcer(CoreEnforcer):
 
     def _update_policies(self, sec, ptype, old_rules, new_rules):
         """updates rules from the current policy."""
+        affected_rules = list(old_rules) + list(new_rules)
+        self._guard_filtered_write(
+            sec, ptype, affected_rules, capability="update_policies"
+        )
+
         rules_updated = self.model.update_policies(sec, ptype, old_rules, new_rules)
 
         if not rules_updated:
@@ -115,6 +130,15 @@ class InternalEnforcer(CoreEnforcer):
 
     def _update_filtered_policies(self, sec, ptype, new_rules, field_index, *field_values):
         """_update_filtered_policies deletes old rules and adds new rules."""
+
+        self._guard_filtered_write(
+            sec,
+            ptype,
+            new_rules,
+            field_index=field_index,
+            field_values=field_values,
+            capability="update_filtered_policies",
+        )
 
         old_rules = self.model.get_filtered_policy(sec, ptype, field_index, *field_values)
 
@@ -140,6 +164,8 @@ class InternalEnforcer(CoreEnforcer):
 
     def _remove_policy(self, sec, ptype, rule):
         """removes a rule from the current policy."""
+        self._guard_filtered_write(sec, ptype, [rule], capability="remove_policy")
+
         rule_removed = self.model.remove_policy(sec, ptype, rule)
         if not rule_removed:
             return rule_removed
@@ -158,6 +184,8 @@ class InternalEnforcer(CoreEnforcer):
 
     def _remove_policies(self, sec, ptype, rules):
         """RemovePolicies removes policy rules from the model."""
+        self._guard_filtered_write(sec, ptype, rules, capability="remove_policies")
+
         rules_removed = self.model.remove_policies(sec, ptype, rules)
         if not rules_removed:
             return rules_removed
@@ -179,6 +207,15 @@ class InternalEnforcer(CoreEnforcer):
 
     def _remove_filtered_policy(self, sec, ptype, field_index, *field_values):
         """removes rules based on field filters from the current policy."""
+        self._guard_filtered_write(
+            sec,
+            ptype,
+            [],
+            field_index=field_index,
+            field_values=field_values,
+            capability="remove_filtered_policy",
+        )
+
         rule_removed = self.model.remove_filtered_policy(sec, ptype, field_index, *field_values)
         if not rule_removed:
             return rule_removed
@@ -197,6 +234,15 @@ class InternalEnforcer(CoreEnforcer):
 
     def _remove_filtered_policy_returns_effects(self, sec, ptype, field_index, *field_values):
         """removes rules based on field filters from the current policy."""
+        self._guard_filtered_write(
+            sec,
+            ptype,
+            [],
+            field_index=field_index,
+            field_values=field_values,
+            capability="remove_filtered_policy",
+        )
+
         rule_removed = self.model.remove_filtered_policy_returns_effects(sec, ptype, field_index, *field_values)
         if len(rule_removed) == 0:
             return rule_removed

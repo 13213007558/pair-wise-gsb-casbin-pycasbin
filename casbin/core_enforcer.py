@@ -25,6 +25,7 @@ from casbin.effect import (
 )
 from casbin.model import Model, FunctionMap
 from casbin.persist import Adapter
+from casbin.persist.adapter import FilteredPolicyError, rule_in_load_scope
 from casbin.persist.adapters import FileAdapter
 from casbin.policy_index import PolicyIndex, policy_matches_bucket
 from casbin.rbac import default_role_manager
@@ -70,6 +71,10 @@ class CoreEnforcer:
         self.logger = logging.getLogger("casbin.enforcer")
         self._policy_indexes = {}
         self._policy_deny_cache = {}
+        # The filter scope of the policy currently held in memory.
+        # None means a complete policy view; a list holds the filters of every
+        # (possibly incremental) filtered load since the last complete load.
+        self._load_filters = None
         if isinstance(model, str):
             if isinstance(adapter, str):
                 self.init_with_file(model, adapter)
@@ -359,6 +364,7 @@ class CoreEnforcer:
 
             self.model = new_model
             self._reset_policy_caches()
+            self._sync_load_scope()
 
         except Exception as e:
             if self.auto_build_role_links and need_to_rebuild:
@@ -382,6 +388,8 @@ class CoreEnforcer:
         if self.auto_build_role_links:
             self.build_role_links()
 
+        self._sync_load_scope(filter)
+
     def load_increment_filtered_policy(self, filter):
         """LoadIncrementalFilteredPolicy append a filtered policy from file/database."""
         if not hasattr(self.adapter, "is_filtered"):
@@ -392,10 +400,78 @@ class CoreEnforcer:
         if self.auto_build_role_links:
             self.build_role_links()
 
+        self._append_load_scope(filter)
+
     def is_filtered(self):
         """returns true if the loaded policy has been filtered."""
 
         return hasattr(self.adapter, "is_filtered") and self.adapter.is_filtered()
+
+    def get_load_filters(self):
+        """returns the filters describing the scope held in memory.
+
+        Returns None for a complete policy view, otherwise the list of filters
+        applied by the filtered loads since the last complete load.
+        """
+        return copy.deepcopy(self._load_filters)
+
+    def _sync_load_scope(self, filter=None):
+        """aligns the enforcer's load-scope state with the adapter after a load."""
+        if self.adapter is not None and hasattr(self.adapter, "is_filtered") and self.adapter.is_filtered():
+            self._load_filters = [copy.deepcopy(filter)]
+        else:
+            self._load_filters = None
+
+    def _append_load_scope(self, filter):
+        """records an additional filtered load on top of the current scope."""
+        if self.adapter is not None and hasattr(self.adapter, "is_filtered") and self.adapter.is_filtered():
+            if self._load_filters is None:
+                self._load_filters = []
+            self._load_filters.append(copy.deepcopy(filter))
+        else:
+            self._load_filters = None
+
+    def _rule_in_load_scope(self, rule, sec):
+        """checks whether a rule is proven to stay inside the loaded scope."""
+        return rule_in_load_scope(rule, sec, self._load_filters)
+
+    def _guard_filtered_write(self, sec, ptype, rules, *, field_index=None, field_values=None, capability=None):
+        """validates a persistence operation before any in-memory mutation.
+
+        It refuses the operation when:
+
+        * the enforcer holds a partial (filtered) view and auto-save is on, and
+        * the adapter does not support the required partial write capability, or
+        * any rule the operation touches cannot be proven to stay inside the
+          filters the partial view was loaded with.
+
+        Raising before the mutation means the in-memory policy is never left in
+        a state that pretends a rejected write succeeded.
+        """
+        if not (self.adapter and self.auto_save and self.is_filtered()):
+            return
+
+        if capability is not None and callable(getattr(self.adapter, capability, None)) is False:
+            raise FilteredPolicyError(
+                f"adapter {type(self.adapter).__name__} does not support {capability!r} on a filtered policy view"
+            )
+
+        for rule in rules:
+            if not self._rule_in_load_scope(rule, sec):
+                raise FilteredPolicyError(
+                    f"filtered write on {ptype!r} escapes the loaded policy scope: {rule}"
+                )
+
+        if field_values is not None:
+            for offset, value in enumerate(field_values):
+                if value is not None and str(value).strip() != "":
+                    target_index = field_index + offset
+                    probe_rule = ["" for _ in range(target_index + 1)]
+                    probe_rule[target_index] = value
+                    if not self._rule_in_load_scope(probe_rule, sec):
+                        raise FilteredPolicyError(
+                            f"filtered write on {ptype!r} escapes the loaded policy scope: {list(field_values)}"
+                        )
 
     def save_policy(self):
         if self.is_filtered():

@@ -17,6 +17,72 @@ import re
 _INTERESTING_TOKENS_RE = re.compile(r"[,\[\]\(\)]")
 
 
+class FilteredPolicyError(RuntimeError):
+    """raised when a persistence operation is not safe on a filtered (partial) policy view.
+
+    This keeps mutations that could overwrite or touch rules outside the loaded
+    filter scope from being applied. The check happens before any in-memory
+    mutation, so callers never get a "false success" where memory was changed but
+    persistence was refused.
+    """
+
+    pass
+
+
+def get_section_filter(filter, sec):
+    """returns the field-level filter that applies to section ``sec``.
+
+    It follows the existing filtered-adapter convention (``Filter.P`` for policy
+    rules and ``Filter.G`` for grouping rules) instead of introducing any new
+    query language. Filters given directly as lists are used for every section.
+    """
+    if filter is None:
+        return []
+
+    if isinstance(filter, dict):
+        return list(filter.get(sec, []))
+
+    section_filter = getattr(filter, "P", None)
+    if section_filter is None and isinstance(filter, (list, tuple)):
+        section_filter = filter
+    if sec == "g":
+        section_filter = getattr(filter, "G", section_filter)
+
+    return list(section_filter or [])
+
+
+def rule_matches_filter(rule, section_filter):
+    """checks whether ``rule`` satisfies one adapter field filter.
+
+    Empty strings and missing entries are wildcards, mirroring the semantics used
+    by FilteredFileAdapter.filter_words.
+    """
+    for index, expected in enumerate(section_filter):
+        if expected is None or str(expected).strip() == "":
+            continue
+        if index >= len(rule) or str(rule[index]).strip() != str(expected).strip():
+            return False
+    return True
+
+
+def rule_in_load_scope(rule, sec, load_filters):
+    """checks whether ``rule`` stays inside every loaded filter scope.
+
+    ``load_filters`` is the list of filters the current partial view was loaded
+    with. When no filtered load happened (``None``), all rules are considered in
+    scope. The check fails closed when section-specific filters exist but the
+    rule cannot be proven to match them.
+    """
+    if not load_filters:
+        return True
+
+    for load_filter in load_filters:
+        section_filter = get_section_filter(load_filter, sec)
+        if section_filter and not rule_matches_filter(rule, section_filter):
+            return False
+    return True
+
+
 def _extract_tokens(line):
     """Return the list of 'tokens' from the line, or None if this line has none"""
 

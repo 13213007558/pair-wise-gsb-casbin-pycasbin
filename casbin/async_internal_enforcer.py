@@ -71,6 +71,7 @@ class AsyncInternalEnforcer(CoreEnforcer):
                     new_model.build_conditional_role_links(self.cond_rm_map)
 
             self.model = new_model
+            self._sync_load_scope()
 
         except Exception as e:
             if self.auto_build_role_links and need_to_rebuild:
@@ -94,6 +95,8 @@ class AsyncInternalEnforcer(CoreEnforcer):
         if self.auto_build_role_links:
             self.build_role_links()
 
+        self._sync_load_scope(filter)
+
     async def load_increment_filtered_policy(self, filter):
         """async append a filtered policy from file/database."""
         if not hasattr(self.adapter, "is_filtered"):
@@ -103,6 +106,8 @@ class AsyncInternalEnforcer(CoreEnforcer):
         self.model.print_policy()
         if self.auto_build_role_links:
             self.build_role_links()
+
+        self._append_load_scope(filter)
 
     async def save_policy(self):
         if self.is_filtered():
@@ -127,6 +132,8 @@ class AsyncInternalEnforcer(CoreEnforcer):
         """async adds a rule to the current policy."""
         if self.model.has_policy(sec, ptype, rule):
             return False
+
+        self._guard_filtered_write(sec, ptype, [rule], capability="add_policy")
 
         if self.adapter and self.auto_save:
             result = await self.adapter.add_policy(sec, ptype, rule)
@@ -156,6 +163,8 @@ class AsyncInternalEnforcer(CoreEnforcer):
             if self.model.has_policy(sec, ptype, rule):
                 return False
 
+        self._guard_filtered_write(sec, ptype, rules, capability="add_policies")
+
         if self.adapter and self.auto_save:
             if hasattr(self.adapter, "add_policies") is False:
                 return False
@@ -183,6 +192,10 @@ class AsyncInternalEnforcer(CoreEnforcer):
 
     async def _update_policy(self, sec, ptype, old_rule, new_rule):
         """async updates a rule from the current policy."""
+        self._guard_filtered_write(
+            sec, ptype, [old_rule, new_rule], capability="update_policy"
+        )
+
         rule_updated = self.model.update_policy(sec, ptype, old_rule, new_rule)
 
         if not rule_updated:
@@ -203,6 +216,11 @@ class AsyncInternalEnforcer(CoreEnforcer):
 
     async def _update_policies(self, sec, ptype, old_rules, new_rules):
         """async updates rules from the current policy."""
+        affected_rules = list(old_rules) + list(new_rules)
+        self._guard_filtered_write(
+            sec, ptype, affected_rules, capability="update_policies"
+        )
+
         rules_updated = self.model.update_policies(sec, ptype, old_rules, new_rules)
 
         if not rules_updated:
@@ -223,6 +241,15 @@ class AsyncInternalEnforcer(CoreEnforcer):
 
     async def _update_filtered_policies(self, sec, ptype, new_rules, field_index, *field_values):
         """async deletes old rules and adds new rules."""
+
+        self._guard_filtered_write(
+            sec,
+            ptype,
+            new_rules,
+            field_index=field_index,
+            field_values=field_values,
+            capability="update_filtered_policies",
+        )
 
         old_rules = self.model.get_filtered_policy(sec, ptype, field_index, *field_values)
 
@@ -253,6 +280,8 @@ class AsyncInternalEnforcer(CoreEnforcer):
 
     async def _remove_policy(self, sec, ptype, rule):
         """async removes a rule from the current policy."""
+        self._guard_filtered_write(sec, ptype, [rule], capability="remove_policy")
+
         rule_removed = self.model.remove_policy(sec, ptype, rule)
         if not rule_removed:
             return rule_removed
@@ -279,6 +308,8 @@ class AsyncInternalEnforcer(CoreEnforcer):
 
     async def _remove_policies(self, sec, ptype, rules):
         """async RemovePolicies removes policy rules from the model."""
+        self._guard_filtered_write(sec, ptype, rules, capability="remove_policies")
+
         rules_removed = self.model.remove_policies(sec, ptype, rules)
         if not rules_removed:
             return rules_removed
@@ -308,6 +339,15 @@ class AsyncInternalEnforcer(CoreEnforcer):
 
     async def _remove_filtered_policy(self, sec, ptype, field_index, *field_values):
         """async removes rules based on field filters from the current policy."""
+        self._guard_filtered_write(
+            sec,
+            ptype,
+            [],
+            field_index=field_index,
+            field_values=field_values,
+            capability="remove_filtered_policy",
+        )
+
         rule_removed = self.model.remove_filtered_policy(sec, ptype, field_index, *field_values)
         if not rule_removed:
             return rule_removed
@@ -334,6 +374,15 @@ class AsyncInternalEnforcer(CoreEnforcer):
 
     async def _remove_filtered_policy_returns_effects(self, sec, ptype, field_index, *field_values):
         """async removes rules based on field filters from the current policy."""
+        self._guard_filtered_write(
+            sec,
+            ptype,
+            [],
+            field_index=field_index,
+            field_values=field_values,
+            capability="remove_filtered_policy",
+        )
+
         rule_removed = self.model.remove_filtered_policy_returns_effects(sec, ptype, field_index, *field_values)
         if len(rule_removed) == 0:
             return rule_removed
